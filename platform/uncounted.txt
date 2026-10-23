@@ -1,0 +1,27 @@
+# Routines the clock does not count as entered (platform/hal.c, address_of): the C
+# composes them where the original branches into their middles or uses the hardware multiplier
+# (Mul16x8XS calls Mul16x8U; Mul16x8XS jumps to Mul16x8U_go). Pure arithmetic on the scratch
+# registers and the carry: an interrupt inside one may come at the next entry instead.
+Mul8U
+Mul8XS
+Mul8S
+Mul16x8U
+Mul16x8XS
+Mul16x8S
+Mul16U
+Mul16XS
+Mul16S
+Mul16x8HiU
+Mul16x8HiXS
+Mul16x8HiS
+Div32U
+Div32S
+Div16U
+Div16S
+Div16x8U
+DivX8U
+DivX8S
+# Bare returns that routines branch to (and skateto's callback): nothing to place an interrupt at
+rtss
+ChkOffsides_rtl
+RosterRtl

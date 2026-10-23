@@ -1,0 +1,822 @@
+/* replay: recording and playing back the replay buffer, the view (src/routines/replay). */
+#include "game.h"
+
+#define WMDATA 0x2180
+#define ReplayBufferEnd_addr (0x7E0000u | RAM_OFF_ReplayBufferEnd)
+
+/* Lock the view at its current position */
+void freezewindow(void)
+{
+    g.yc1 = g.Vpos;
+    g.xc1 = g.Hpos;
+    g.sflags |= sfslock;
+}
+
+/* The next replay frame record after a4 (the buffer wraps round to its start; suba4 has its own copy) */
+static uint32_t next_record(uint32_t a4)
+{
+    uint32_t lo = (a4 & 0xFFFF) + replaysize, hi = a4 >> 16 & 0xFFFF;
+    if (lo >> 16) hi = (hi + 1) & 0xFFFF;
+    lo &= 0xFFFF;
+    if (lo == (ReplayBufferEnd_addr & 0xFFFF) && hi == ReplayBufferEnd_addr >> 16) return ReplayBufferStart;
+    return hi << 16 | lo;
+}
+uint32_t adda43(uint32_t a4) { return next_record(a4); }
+
+/* arithmetic shift right by 4, at least 1 away from 0 (checkwindow's step toward the target) */
+static uint16_t view_step(uint16_t a)
+{
+    a = (uint16_t)(a >> 4 | (a & 0x8000 ? 0xF000 : 0));
+    return a ? a : 1;
+}
+
+/* Move the view so the screen follows the puck (or the lock position yc1 / xc1): the puck's y
+ * plus its lead (yleader, toward the goal it is heading for), a sixteenth of the way a frame once
+ * past a dead zone, within the rink's limits */
+void checkwindow(void)
+{
+    uint16_t d2 = (uint16_t)g.yc1, d3 = (uint16_t)g.xc1;
+    if (!(g.sflags & sfslock)) {
+        uint16_t x = 0x1C;
+        if (!(g.puckc & 0x8000)) {
+            x = (uint16_t)g.puckc;
+            if (r16(RAM_OFF_pfgoal + x)) {
+                g.yleader = (uint16_t)(g.yleader + g.impactstep + cf);
+                if (!((uint16_t)(g.yleader - 0x32) & 0x8000)) g.yleader = 0x32;
+            } else {
+                g.yleader = (uint16_t)(g.yleader - g.impactstep);
+                if ((uint16_t)(g.yleader - 0xFFCF) & 0x8000) g.yleader = 0xFFCE;
+            }
+        }
+        uint16_t v = r16(RAM_OFF_Yvel + x);
+        v = (uint16_t)(v >> 7 | (v & 0x8000 ? 0xFE00 : 0));
+        d2 = (uint16_t)(v + r16(RAM_OFF_Ypos + x) + g.yleader);
+        g.yc1 = (int16_t)d2;
+        d3 = r16(RAM_OFF_Xpos + x);
+        g.xc1 = (int16_t)d3;
+    }
+    uint16_t d0 = (uint16_t)(d2 - g.Vpos), d1;
+    int move = 1;
+    if ((uint16_t)(d0 - 0xFFF7) & 0x8000) {
+        d1 = (uint16_t)(d2 - 0xFFF6);
+        if ((uint16_t)(d1 - 0xFF39) & 0x8000) d1 = 0xFF39;
+    } else if ((uint16_t)(d0 - 0xB) & 0x8000) move = 0;
+    else {
+        d1 = (uint16_t)(d2 - 0xA);
+        if (!((uint16_t)(d1 - 0x100) & 0x8000)) d1 = 0x100;
+    }
+    if (move) {
+        uint16_t a = (uint16_t)(d1 - g.Vpos);
+        if (a) g.Vpos = (int16_t)(view_step(a) + g.Vpos);
+    }
+    d0 = (uint16_t)(d3 - g.Hpos);
+    move = 1;
+    if ((uint16_t)(d0 - 0xFFD8) & 0x8000) {
+        d1 = (uint16_t)(d3 - 0xFFD8);
+        if ((uint16_t)(d1 - 0xFFC4) & 0x8000) d1 = 0xFFC4;
+    } else if ((uint16_t)(d0 - 0x29) & 0x8000) move = 0;
+    else {
+        d1 = (uint16_t)(d3 - 0x28);
+        if (!((uint16_t)(d1 - 0x3D) & 0x8000)) d1 = 0x3C;
+    }
+    if (move) {
+        uint16_t a = (uint16_t)(d1 - g.Hpos);
+        if (a) g.Hpos = (int16_t)(view_step(a) + g.Hpos);
+    }
+}
+
+/* a byte's sign as a high byte */
+static uint8_t sign8(uint8_t b) { return b & 0x80 ? 0xFF : 0; }
+
+/* Save this frame into the replay buffer (through the work RAM port): each object's position,
+ * frame and flip bits, the roster numbers and positions, the puck's heights, the sounds, the pads'
+ * objects, the crowd, the view. Not in highlights or while the replay delay counts down. */
+void updatereplay(void)
+{
+    if (g.gmode & gmhl) return;
+    if (g.replaydelay) {
+        uint16_t a = (uint16_t)(g.replaydelay - 1);
+        if (!a) return;
+        g.replaydelay = a;
+    }
+    if (!(g.sflags & sf2drec)) {
+        uint32_t lo = (g.ReplayBufferPtr & 0xFFFF) + replaysize;
+        uint32_t hi = g.ReplayBufferPtr >> 16;
+        if (lo >> 16) hi = (hi + 1) & 0xFFFF;
+        lo &= 0xFFFF;
+        g.ReplayBufferPtr = hi << 16 | lo;
+        if (lo == (ReplayBufferEnd_addr & 0xFFFF) && hi == ReplayBufferEnd_addr >> 16) {
+            g.sflags |= sfwrap;
+            g.ReplayBufferPtr = ReplayBufferStart;
+        }
+    }
+    io_w16(0x2181, (uint16_t)g.ReplayBufferPtr);
+    io_w8(0x2183, (uint8_t)(g.ReplayBufferPtr >> 16));
+    for (int x = 0; x < 0x20; x += 2) {
+        io_w8(WMDATA, r8(RAM_OFF_Xpos + x));
+        io_w8(WMDATA, (uint8_t)(r8(RAM_OFF_Ypos + 1 + x) << 4 | (r8(RAM_OFF_Xpos + 1 + x) & 0x0F)));
+        io_w8(WMDATA, r8(RAM_OFF_Ypos + x));
+        io_w8(WMDATA, r8(RAM_OFF_frame + x));
+        io_w8(WMDATA, (uint8_t)((r8(RAM_OFF_attribute + 1 + x) & 0x18) << 3 | (r8(RAM_OFF_frame + 1 + x) & 0x3F)));
+    }
+    for (int x = 0; x < 24; x += 4) {
+        io_w8(WMDATA, r8(RAM_OFF_rostnum + x));
+        io_w8(WMDATA, r8(RAM_OFF_rostnum + 2 + x));
+        uint8_t p = r8(RAM_OFF_position + x), q = r8(RAM_OFF_position + 2 + x);
+        if (p & 0x80) p = 0xFF;
+        if (q & 0x80) q = 0xFF;
+        io_w8(WMDATA, (uint8_t)(q << 4 | (p & 0x0F)));
+    }
+    io_w8(WMDATA, r8(RAM_OFF_puckz));
+    io_w8(WMDATA, r8(RAM_OFF_shadowz));
+    io_w8(WMDATA, r8(RAM_OFF_recsfx));
+    io_w8(WMDATA, r8(RAM_OFF_recsfxpitch));
+    io_w8(WMDATA, r8(RAM_OFF_recsfxpitch + 1));
+    io_w8(WMDATA, r8(RAM_OFF_recsfxvol + 1));
+    io_w8(WMDATA, r8(RAM_OFF_recsfx2));
+    io_w8(WMDATA, r8(RAM_OFF_recsfxpitch2));
+    io_w8(WMDATA, r8(RAM_OFF_recsfxpitch2 + 1));
+    io_w8(WMDATA, r8(RAM_OFF_recsfxvol2 + 1));
+    io_w8(WMDATA, (uint8_t)g.d7);
+    for (int k = 0; k < 12; k += 4)
+        io_w8(WMDATA, (uint8_t)(g.PadControlObj[k + 2] << 4 | g.PadControlObj[k]));
+    io_w8(WMDATA, r8(RAM_OFF_Crowdlevel));
+    io_w8(WMDATA, r8(RAM_OFF_Crowdlevel + 1));
+    io_w8(WMDATA, r8(RAM_OFF_PBnum));
+    io_w8(WMDATA, r8(RAM_OFF_Hpos));
+    io_w8(WMDATA, r8(RAM_OFF_Hpos + 1));
+    io_w8(WMDATA, r8(RAM_OFF_Vpos));
+    io_w8(WMDATA, r8(RAM_OFF_Vpos + 1));
+    io_w8(WMDATA, r8(RAM_OFF_benchframe));
+    io_w8(WMDATA, r8(RAM_OFF_benchframe + 1));
+    g.recsfx = 0xFFFF;
+    g.recsfx2 = 0xFFFF;
+}
+
+/* a nibble of the record as a signed byte (8-15 negative) */
+static uint8_t sx4(uint8_t n) { return n & 8 ? (uint8_t)(n | 0xF0) : n; }
+
+/* Put the replay frame record at a4 back into the objects, the puck, the sounds and the view
+ * (through the work RAM port; the view stays when sflags bit 5 is set) */
+void RestoreReplayFrame(uint32_t a4)
+{
+    g.replaynewframe++;
+    io_w16(0x2181, (uint16_t)a4);
+    io_w8(0x2183, (uint8_t)(a4 >> 16));
+    for (int x = 0; x < 0x20; x += 2) {
+        w8(RAM_OFF_Xpos + x, io_r8(WMDATA));
+        uint8_t r3 = io_r8(WMDATA);
+        w8(RAM_OFF_Xpos + 1 + x, sx4(r3 & 0x0F));
+        w8(RAM_OFF_Ypos + x, io_r8(WMDATA));
+        w8(RAM_OFF_Ypos + 1 + x, sx4(r3 >> 4));
+        w8(RAM_OFF_frame + x, io_r8(WMDATA));
+        r3 = io_r8(WMDATA);
+        w8(RAM_OFF_frame + 1 + x, r3 & 0x3F);
+        uint8_t at = r8(RAM_OFF_attribute + 1 + x) & 0xE7;
+        w8(RAM_OFF_attribute + 1 + x, (uint8_t)((r3 >> 3 & 0x18) | at));
+    }
+    for (int x = 0; x < 24; x += 4) {
+        w8(RAM_OFF_rostnum + x, io_r8(WMDATA));
+        w8(RAM_OFF_rostnum + 2 + x, io_r8(WMDATA));
+        w8(RAM_OFF_position + 1 + x, 0);
+        uint8_t r3 = io_r8(WMDATA), a = r3 & 0x0F;
+        if (a == 0x0F) { a = 0xFF; w8(RAM_OFF_position + 1 + x, 0xFF); }
+        w8(RAM_OFF_position + x, a);
+        w8(RAM_OFF_position + 3 + x, 0);
+        a = r3 >> 4;
+        if (a == 0x0F) { a = 0xFF; w8(RAM_OFF_position + 3 + x, 0xFF); }
+        w8(RAM_OFF_position + 2 + x, a);
+    }
+    uint8_t b = io_r8(WMDATA);
+    w8(RAM_OFF_puckz, b);
+    w8(RAM_OFF_puckz + 1, sign8(b));
+    b = io_r8(WMDATA);
+    w8(RAM_OFF_shadowz, b);
+    w8(RAM_OFF_shadowz + 1, sign8(b));
+    w8(RAM_OFF_recsfx, io_r8(WMDATA));
+    w8(RAM_OFF_recsfxpitch, io_r8(WMDATA));
+    w8(RAM_OFF_recsfxpitch + 1, io_r8(WMDATA));
+    w8(RAM_OFF_recsfxvol + 1, io_r8(WMDATA));
+    w8(RAM_OFF_recsfx2, io_r8(WMDATA));
+    w8(RAM_OFF_recsfxpitch2, io_r8(WMDATA));
+    w8(RAM_OFF_recsfxpitch2 + 1, io_r8(WMDATA));
+    w8(RAM_OFF_recsfxvol2 + 1, io_r8(WMDATA));
+    w8(RAM_OFF_d7, io_r8(WMDATA));
+    for (int k = 0; k < 12; k += 4) {
+        uint8_t r3 = io_r8(WMDATA);
+        g.PadControlObj[k] = r3 & 0x0F;
+        g.PadControlObj[k + 2] = r3 >> 4;
+    }
+    w8(RAM_OFF_Crowdlevel, io_r8(WMDATA));
+    w8(RAM_OFF_Crowdlevel + 1, io_r8(WMDATA));
+    b = io_r8(WMDATA);
+    w8(RAM_OFF_PBnum, b);
+    w8(RAM_OFF_PBnum + 1, sign8(b));
+    if (!(g.sflags & 0x20)) {
+        w8(RAM_OFF_Hpos, io_r8(WMDATA));
+        w8(RAM_OFF_Hpos + 1, io_r8(WMDATA));
+        w8(RAM_OFF_Vpos, io_r8(WMDATA));
+        w8(RAM_OFF_Vpos + 1, io_r8(WMDATA));
+    } else {
+        for (int i = 0; i < 4; i++) io_r8(WMDATA);
+    }
+    w8(RAM_OFF_benchframe, io_r8(WMDATA));
+    w8(RAM_OFF_benchframe + 1, io_r8(WMDATA));
+    g.recsfx = (uint16_t)(int8_t)(g.recsfx & 0xFF);
+    g.recsfx2 = (uint16_t)(int8_t)(g.recsfx2 & 0xFF);
+}
+
+/* Move the replay one frame forward from a4 (frames elapsed d7 = 0): not onto the record being
+ * written; returns the new a4 */
+uint32_t adda4(uint32_t a4)
+{
+    w16(RAM_OFF_d7, 0);
+    if ((g.sflags & sf2drec) && adda43(a4) == g.ReplayBufferPtr) return a4;
+    if (a4 == g.ReplayBufferPtr) return a4;
+    RestoreReplayFrame(a4);
+    return adda43(a4);
+}
+
+/* Move the replay one frame back from a4: not past the buffer's start unless it has wrapped, nor
+ * onto the record being written; returns the new a4 */
+uint32_t suba4(uint32_t a4)
+{
+    if (a4 == ReplayBufferStart) {
+        if (!(g.sflags & sfwrap)) { RestoreReplayFrame(a4); g.d7 = 0; return a4; }
+        a4 = ReplayBufferEnd_addr;
+    }
+    uint32_t lo = (a4 & 0xFFFF) - replaysize, hi = (a4 >> 16) - ((lo >> 16) & 1);
+    a4 = (hi & 0xFFFF) << 16 | (lo & 0xFFFF);
+    if (a4 != g.ReplayBufferPtr) { RestoreReplayFrame(a4); return a4; }
+    a4 = next_record(a4);
+    g.d7 = 0;
+    return a4;
+}
+
+
+/* Step object o's sprite animation, looping or ending it: the frame list for its facing direction
+ * (mirrored for flipped players, turned for the horizontal rink), the next frame when its count
+ * runs out; at the end the animation is cleared (unless it loops, word $10) and the bench
+ * animations take the player to the door */
+void updateanim(int o)
+{
+    uint16_t spa = g.SPA[o];
+    if (!spa) {
+        g.pf2aip[o] = 0;
+        g.pfalock[o] = 0;
+        return;
+    }
+    uint32_t a0 = (SYM_SPAlist & 0xFF0000) | spa;
+    uint16_t d1 = m16(a0 + 0x10), dir;
+    if (g.sfhormode && o < 12)
+        dir = g.attribute[o] & 0x0800 ? (uint16_t)(2 - g.facedir[o]) : (uint16_t)(g.facedir[o] - 2);
+    else if (spa < (uint16_t)SYM_SPAbenchcheckr && (g.attribute[o] & 0x0800))
+        dir = (uint16_t)-g.facedir[o];
+    else
+        dir = g.facedir[o];
+    a0 = (a0 & 0xFF0000) | m16(a0 + (uint16_t)((dir & 7) << 1));
+    uint16_t d0 = g.SPAnum[o];
+    uint16_t d2 = m16(a0 + d0);
+    if (!(g.SPAcnt[o] & 0x8000)) {
+        g.SPAcnt[o] = (uint16_t)(g.SPAcnt[o] - g.timestep);
+        if (!(g.SPAcnt[o] & 0x8000)) { g.frame[o] = d2; return; }
+        uint16_t y = (uint16_t)(d0 + 2);
+        g.SPAnum[o] = (uint16_t)(g.SPAnum[o] + 4);
+        d0 = g.SPAnum[o];
+        if (m16(a0 + y) & 0x8000) {
+            d0 = 0;
+            g.SPAnum[o] = 0;
+            g.pf2aip[o] = 0;
+            g.pfalock[o] = 0;
+            if (spa < (uint16_t)SYM_SPAunused1 && spa >= (uint16_t)SYM_SPAbenchcheckr) {
+                g.Xpos[o] = (int16_t)0xFF78;
+                g.facedir[o] = 2;
+                g.pfalock[o] = 2;
+                SetSPAUpdate(o, (uint16_t)SYM_SPAwallright);
+                return;
+            }
+            if (!d1) g.SPA[o] = 0;
+        }
+    }
+    uint16_t c = m16(a0 + (uint16_t)(d0 + 2));
+    if (c & 0x8000) c = (uint16_t)-c;
+    g.SPAcnt[o] = c;
+    g.frame[o] = d2;
+}
+
+#define SPFpuck 396
+
+/* (the jsl jmlvector of updateplayers: assignment addr, an asstab entry, for object o of team a2;
+ * a3 = o) */
+static void run_assignment(uint32_t addr, int o, uint16_t a2)
+{
+    switch (addr) {
+    case SYM_rtss: rtss(); break;
+    case SYM_assdefo: assdefo(o, a2, o); break;
+    case SYM_assdefd: assdefd(o, a2, o); break;
+    case SYM_asswingd: asswingd(o, a2, o); break;
+    case SYM_asswingo: asswingo(o, a2, o); break;
+    case SYM_asscenterd: asscenterd(o, o); break;
+    case SYM_asscentero: asscentero(o, a2, o); break;
+    case SYM_assgoalie: assgoalie(o, a2, o); break;
+    case SYM_assscore: assscore(o, a2, o); break;
+    case SYM_assstanley: assstanley(o); break;
+    case SYM_asseben: asseben(o); break;
+    case SYM_assepen: assepen(o, a2); break;
+    case SYM_assbench: assbench(o, o); break;
+    case SYM_asspenalty: asspenalty(o, a2, o); break;
+    case SYM_assdopen: assdopen(o); break;
+    case SYM_assgoalietopuck: assgoalietopuck(o, o); break;
+    case SYM_assbreakaway: assbreakaway(o, o); break;
+    case SYM_asspuckc: asspuckc(o, o); break;
+    case SYM_assnearest: assnearest(o, a2, o); break;
+    case SYM_assshoot: assshoot(o, o); break;
+    case SYM_assdumpin: assdumpin(o, o); break;
+    case SYM_asspassrec: asspassrec(o, a2, o); break;
+    case SYM_assfaceoff: assfaceoff(o); break;
+    case SYM_assfaceoffpl: assfaceoffpl(o); break;
+    case SYM_pucknorm: pucknorm(o, o, r16(RAM_OFF_d0), r16(RAM_OFF_a0)); break;   /* (d0, a0: the direct page's) */
+    case SYM_puckshadow: puckshadow(o); break;
+    case SYM_pucknothing: pucknothing(); break;
+    case SYM_puckfaceoff: puckfaceoff(o, o, r16(RAM_OFF_d0), r16(RAM_OFF_a0)); break;   /* (d0, a0: the direct page's) */
+    case SYM_puckfaceoff2: puckfaceoff2(o, o); break;
+    }
+}
+
+/* |a| (bit 15 the sign) */
+static uint16_t abs16(uint16_t a) { return a & 0x8000 ? (uint16_t)-a : a; }
+
+/* a - step, at least 0 (the count downs by timestep and impactstep) */
+static uint16_t count_down(uint16_t a, uint16_t step)
+{
+    a = (uint16_t)(a - step);
+    return a & 0x8000 ? 0 : a;
+}
+
+/* Every object's frame: first (from the last object) the animation, the counts, the velocity decay
+ * and the move by it (the puck's height with gravity and its bounce sound), the distance and
+ * direction to the puck, the nearest player of each team, the icing waved off; the nets kept in
+ * their ends; then (from the first) each player's pad input and assignment, goalies kept out of the
+ * goal posts, collisions (players crossing the goal line beside the net put back) and the impact
+ * decay (an absent object's impact = its position); the puck kept within the boards */
+void updateplayers(void)
+{
+    g.topgoalie = 0xFFFF;
+    g.botgoalie = 0xFFFF;
+    g.tmnear[0] = g.tmnear[1] = 0xFFFF;
+    g.tmnearpl[0] = g.tmnearpl[1] = 0xFFFF;
+    g.puckoldz = g.puckz;
+    for (uint16_t x = 0x1E; !(x & 0x8000); x = (uint16_t)(x - 2)) {
+        int o = x >> 1;
+        g.curobj = x;
+        g.OldXpos[o] = g.Xpos[o];
+        g.OldXfrac[o] = g.Xfrac[o];
+        g.OldYpos[o] = (int16_t)r16(RAM_OFF_Ypos + x);
+        g.OldYfrac[o] = g.Yfrac[o];
+        if (x == netobj1 || x == netobj2) goto decay;
+        if (g.position[o] & 0x8000) goto dist;
+        if (!g.position[o]) {
+            if (r16(RAM_OFF_Ypos + x) & 0x8000) g.botgoalie = x;
+            else g.topgoalie = x;
+        }
+        updateanim(o);
+        g.nopuck[o] = count_down(g.nopuck[o], g.timestep);
+        g.nopuckb[o] = count_down(g.nopuckb[o], g.timestep);
+        if (g.sflags3[0] & 0x0020) {
+            uint16_t d0 = g.pnum[o] & 0xFF;
+            if (d0 >= 0x80) d0 |= 0xFF00;
+            if (!(d0 & 0x8000)) loadTeamStruct(o);
+        }
+        if (g.goaliedivewait[o]) g.goaliedivewait[o] = count_down(g.goaliedivewait[o], g.timestep);
+        if (x == g.passReceiverPlayerNum && g.onetimer) goto move;
+        if (g.SPA[o] == (uint16_t)SYM_SPAinjury1 || g.SPA[o] >= (uint16_t)SYM_SPAboardfront) goto dist;
+        if (x == puckobj && g.puckz) goto move;
+    decay:
+        hal_cost_mark(SYM_updateplayers_9);
+        uint16_t d2 = rom8(SYM_updateplayers_20 + g.timestep);
+        if (g.pflags[o] & 1) d2 = rom8(SYM_updateplayers_22 - 1 + g.timestep);
+        w16(RAM_OFF_Xvel + x, Mul16x8HiXS(r16(RAM_OFF_Xvel + x), d2));
+        w16(RAM_OFF_Yvel + x, Mul16x8HiXS(r16(RAM_OFF_Yvel + x), d2));
+    move:
+        hal_cost_mark(SYM_updateplayers_10);
+        uint16_t v = r16(RAM_OFF_Xvel + x);
+        if (v) {
+            uint32_t r2 = Mul16x8XS(v, g.velstep), s = (uint32_t)(uint16_t)r2 + g.Xfrac[o];
+            g.Xfrac[o] = (uint16_t)s;
+            g.Xpos[o] = (int16_t)(uint16_t)((r2 >> 16) + (uint16_t)g.Xpos[o] + (s >> 16));
+        }
+        hal_cost_mark(SYM_updateplayers_1xxx);
+        v = r16(RAM_OFF_Yvel + x);
+        if (v) {
+            uint32_t r2 = Mul16x8XS(v, g.velstep), s = (uint32_t)(uint16_t)r2 + g.Yfrac[o];
+            g.Yfrac[o] = (uint16_t)s;
+            w16(RAM_OFF_Ypos + x, (uint16_t)((r2 >> 16) + r16(RAM_OFF_Ypos + x) + (s >> 16)));
+        }
+        hal_cost_mark(SYM_updateplayers_2xx);
+        if (x == puckobj && !(g.puckz & 0x8000) && (g.puckz || g.puckvz)) {
+            hal_cost_mark(SYM_updateplayers_3x);
+            g.puckvz = (int16_t)(g.puckvz - g.gravstep);
+            uint32_t r2 = Mul16x8XS((uint16_t)g.puckvz, g.velstep), s = (uint32_t)(uint16_t)r2 + g.puckzfrac;
+            g.puckzfrac = (uint16_t)s;
+            g.puckz = (int16_t)(uint16_t)((r2 >> 16) + (uint16_t)g.puckz + (s >> 16));
+            if (g.puckz & 0x8000) {
+                g.puckz = 0;
+                g.puckzfrac = 0;
+                uint16_t vz = (uint16_t)((uint16_t)-g.puckvz >> 1);
+                g.puckvz = (int16_t)vz;
+                if (!((uint16_t)(vz - 0x200) & 0x8000)) sfx(7, (uint16_t)(vz << 2), 0);
+            }
+        }
+    dist:
+        hal_cost_mark(SYM_updateplayers_11);
+        uint16_t d0 = (uint16_t)(g.Xpos[14] - g.Xpos[o]), ax = abs16(d0);
+        g.puckdist2[o] = Mul8U(ax >> 2, ax >> 2);
+        uint16_t d1 = (uint16_t)(g.pucky[0] - r16(RAM_OFF_Ypos + x)), ay = abs16(d1);
+        uint16_t sq = (uint16_t)(Mul8U(ay >> 2, ay >> 2) + g.puckdist2[o]);
+        g.puckdist2[o] = sq;
+        if (x < 0x18 && !(g.position[o] & 0x8000) && g.position[o] && !((g.pflags[o] & 0x1000) | g.pfalock[o])) {
+            int t = x >= 0xC;
+            if (sq < g.tmnear[t]) {
+                g.tmnear[t] = sq;
+                g.tmnearpl[t] = x;
+            }
+        }
+        uint16_t len = ApproxLength_abs(ay, ax);
+        g.puckdist[o] = len;
+        if (x < 0x18 && len < 0x1E && (g.iflags & 4) && !(g.iflags & 1)
+            && ((g.iflags & 2) ? !g.pfgoal[o] : g.pfgoal[o])
+            && (uint16_t)g.puckz < 0xD && (uint16_t)g.puckvy[0] < 0x2400 && !((uint16_t)(g.puckvy[0] - 0xDC00) & 0x8000))
+            g.iflags &= (uint16_t)~5;
+        g.puckdir[o] = vtoa(d0, d1);
+    }
+    uint16_t y = r16(RAM_OFF_Ypos + netobj1);
+    if (!((uint16_t)(y - 0x11F) & 0x8000)) y = 0x11F;
+    w16(RAM_OFF_Ypos + netobj1, y);
+    y = r16(RAM_OFF_Ypos + netobj2);
+    if ((uint16_t)(y - 0xFED2) & 0x8000) y = 0xFED2;
+    w16(RAM_OFF_Ypos + netobj2, y);
+    for (int k = 0xC; k >= 0; k -= 2) w16(RAM_OFF_PadControlObj + k, 0xF);
+    for (int k = 0; k < 5; k++) g.padinputdone[k] = 0;
+    g.curobjteam = 0;
+    g.curobjopp[0] = 2;
+    for (uint16_t x = 0; x != 0x20; x += 2) {
+        int o = x >> 1;
+        g.curobj = x;
+        if (x == 0xC) {
+            g.curobjteam = 2;
+            g.curobjopp[0] = 0;
+        }
+        g.PlayersUnused[0] = 0xFFFF;
+        if (g.position[o] & 0x8000) {
+            g.impact[o] = g.position[o];
+            continue;
+        }
+        if (x == (uint16_t)g.puckc && !g.sfhormode) setpads(o, 0);
+        if (x < 0x18 && !(g.playerpad[o] & 0x8000)) {
+            uint16_t p = g.playerpad[o];
+            if (!r16(RAM_OFF_padinputdone + p)) {
+                w16(RAM_OFF_padinputdone + p, 1);
+                doinput(o, r16(RAM_OFF_paddir + p), r16(RAM_OFF_padnew + p), r16(RAM_OFF_padchange + p), r16(RAM_OFF_JoyPad + p), (uint16_t)(p + 2), o);
+            }
+        }
+        if (!g.pfalock[o]) {
+            uint32_t t = SYM_asstab + (uint16_t)(g.asscur[o] << 2);
+            w16(RAM_OFF_jmlvector + 1, rom16(t));
+            w16(RAM_OFF_jmlvector + 2, rom16(t + 1));
+            run_assignment(rom24(t), o, loadTeamStruct(o));
+        }
+        if (!((uint16_t)g.position[o] | g.gmclock) && x < 0x18 && x != (uint16_t)g.puckc && !(g.goalieflags[o] & 1)) {
+            uint16_t a = (uint16_t)g.Xpos[o];
+            if (!((uint16_t)(a - 0xFFD5) & 0x8000)) {
+                if (!((uint16_t)(a - 0x2C) & 0x8000) && ((uint16_t)(a - 0x31) & 0x8000)) { a = 0x2B; w16(RAM_OFF_Xvel + x, 0); }
+            } else if (!((uint16_t)(a - 0xFFCF) & 0x8000)) { a = 0xFFD5; w16(RAM_OFF_Xvel + x, 0); }
+            g.Xpos[o] = (int16_t)a;
+            a = r16(RAM_OFF_Ypos + x);
+            if (!(a & 0x8000)) {
+                if (((uint16_t)(a - 0xE5) & 0x8000) && !((uint16_t)(a - 0xE0) & 0x8000)) { w16(RAM_OFF_Ypos + x, 0xE5); w16(RAM_OFF_Yvel + x, 0); }
+            } else if (!((uint16_t)(a - 0xFF1C) & 0x8000) && ((uint16_t)(a - 0xFF21) & 0x8000)) { w16(RAM_OFF_Ypos + x, 0xFF1B); w16(RAM_OFF_Yvel + x, 0); }
+        }
+        g.Wallcos[o] = 0;
+        g.Wallsin[o] = 0;
+        uint16_t d3 = r16(RAM_OFF_Ypos + x), d2 = (uint16_t)g.Xpos[o];
+        if (d2 != (uint16_t)g.OldXpos[o] || d3 != (uint16_t)g.OldYpos[o]) {
+            checkcoll(o, d2, d3, o);
+            uint16_t xp = (uint16_t)g.Xpos[o];
+            if (x < 0x18 && g.position[o] && !((g.pflags[o] & 0x8000) | g.sfhormode)
+                && !((uint16_t)(xp - 0xFFE7) & 0x8000) && ((uint16_t)(xp - 0x19) & 0x8000)) {
+                uint16_t ay = abs16(r16(RAM_OFF_Ypos + x)), r0 = (uint16_t)(ay - 0x10D);
+                if ((((uint16_t)(abs16((uint16_t)g.OldYpos[o]) - 0x10D) ^ r0) & 0x8000) || (ay >= 0x103 && ay < 0x117)) {
+                    g.Xpos[o] = g.OldXpos[o];
+                    w16(RAM_OFF_Ypos + x, (uint16_t)g.OldYpos[o]);
+                }
+            }
+        }
+        g.impact[o] = (int16_t)count_down((uint16_t)g.impact[o], g.impactstep);
+    }
+    cf = 1;   /* (the carry of the last compare, which checkwindow adds) */
+    if ((uint16_t)g.puckz < 0x18) {
+        cf = (uint16_t)g.Xpos[14] >= 0xFF78;
+        if ((uint16_t)(g.Xpos[14] - 0xFF78) & 0x8000) {
+            g.Xpos[14] = (int16_t)0xFF78;
+            cf = (uint16_t)g.frame[14] >= SPFpuck;
+            if (g.frame[14] == SPFpuck) g.Xpos[15] = (int16_t)0xFF78;
+        }
+        cf = (uint16_t)g.Xpos[14] >= sideline;
+        if (!((uint16_t)(g.Xpos[14] - sideline) & 0x8000)) {
+            g.Xpos[14] = sideline;
+            cf = (uint16_t)g.frame[14] >= SPFpuck;
+            if (g.frame[14] == SPFpuck) g.Xpos[15] = sideline;
+        }
+    }
+    if (!g.puckz) {
+        uint16_t py = (uint16_t)g.pucky[0];
+        cf = py >= 0xFEC2;
+        if (!((uint16_t)(py - 0xFEC2) & 0x8000)) {
+            cf = py >= 0x13E;
+            if ((uint16_t)(py - 0x13E) & 0x8000) {
+                cf = py >= 0xFEDB;
+                if ((uint16_t)(py - 0xFEDB) & 0x8000) {
+                    g.pucky[0] = (int16_t)0xFEDB;
+                    g.pucky[1] = (int16_t)0xFEDB;
+                }
+                py = (uint16_t)g.pucky[0];
+                cf = py >= 0x12A;
+                if (!((uint16_t)(py - 0x12A) & 0x8000)) {
+                    g.pucky[0] = 0x12A;
+                    g.pucky[1] = 0x12A;
+                }
+            }
+        }
+    }
+    if (!(g.puckc & 0x8000)) g.carriedy = (uint16_t)g.pucky[0];
+}
+
+
+#define CAM (camobj >> 1)
+
+/* (ReplayMode: the camera's step from cur toward target, at most step) */
+static uint16_t ease(uint16_t target, uint16_t cur, uint16_t step)
+{
+    uint16_t a;
+    if ((uint16_t)(target - cur) & 0x8000) {
+        a = (uint16_t)(cur - step);
+        return (uint16_t)(a - target) & 0x8000 ? target : a;
+    }
+    a = (uint16_t)(cur + step);
+    return (uint16_t)(a - target) & 0x8000 ? a : target;
+}
+
+/* (ReplayMode: the view's limits, x -64 to 64 and y -199 to 256) */
+static uint16_t clamp_h(uint16_t a)
+{
+    if ((uint16_t)(a - 0xFFC0) & 0x8000) a = 0xFFC0;
+    if (!((uint16_t)(a - 0x40) & 0x8000)) a = 0x40;
+    return a;
+}
+/* (ReplayMode: the camera's y, replayVpos, kept to -199 .. 256) */
+static uint16_t clamp_v(uint16_t a)
+{
+    if ((uint16_t)(a - 0xFF39) & 0x8000) a = 0xFF39;
+    if (!((uint16_t)(a - 0x100) & 0x8000)) a = 0x100;
+    return a;
+}
+
+/* (ReplayMode: replay recorded sound s (its low byte, $FF none): a streamed one from $16 on, else
+ * queued with its volume, and a voice it starts in ADSR gets the recorded pitch) */
+static void replay_sound(uint16_t s, uint16_t vol, uint16_t pitch)
+{
+    s &= 0xFF;
+    if (s == 0xFF) return;
+    if (s >= 0x16) {
+        StreamSfx((uint16_t)(s - 0x15));
+        return;
+    }
+    g.SfxVelocity = vol;
+    uint16_t y = QueueSound(s);
+    if (r8(RAM_OFF_VoiceState + y) != 2) return;
+    w8(RAM_OFF_VoiceState + y, 3);
+    w16(RAM_OFF_VoicePitch + (uint16_t)(y << 1), pitch);
+}
+
+/* The instant replay: from the start of the recorded play (half way back to where the replay
+ * buffer's frames restart), frame by frame with the control panel. The camera follows the player
+ * the pad points at (or a free cursor the pad moves, kept off the boards), else the puck carrier
+ * or the puck; buttons step back / forward, play on (with the recorded sounds) or stop; on exit
+ * the game's frame, view and rink come back, then the sound and screen fade and the menu music
+ * plays again if it was on. (phk / plb: the data bank is the program's from the free cursor on.) */
+void ReplayMode(void)
+{
+    while (g.SoundFadeSpeed) hal_wait_interrupt();
+    SPCGameUpload();
+    g.Crowdlevel = 0;
+    g.sflags |= 0x0800;
+    ClrHor();
+    g.textdirtylo = 0xFFFF;
+    g.textdirtyhi = 0;
+    FillVRAMSplit((uint16_t)(g.blankchar + g.charofs), 0x400, 0);
+    g.replaylock = 0xFFFF;
+    g.replaypanel = 0xFFFF;
+    g.MapVRAM = 0;
+    MapPartToVRAMOffset(rinkmapbuf, g.charofs, 2, 2, 0x2000, 0x20, 0x55, 8, 8);
+    uint32_t saved_ptr = g.ReplayBufferPtr;
+    g.sflags &= (uint16_t)~0x20;
+    int16_t saved_v = g.Vpos, saved_h = g.Hpos;
+    uint32_t p = g.ReplayBufferPtr;
+    if (p < ReplayBufferStart || ReplayBufferEnd_addr < p || (p - ReplayBufferStart) >> 16) g.ReplayBufferPtr = ReplayBufferStart;   /* (Div32U's quotient unused) */
+    uint32_t a4 = g.ReplayBufferPtr;
+    uint16_t n = 0;
+    do {
+        a4 = suba4(a4);
+        n++;
+    } while (g.d7);
+    for (n >>= 1; n; n--) a4 = adda4(a4);
+    g.replayHpos = (uint16_t)g.Hpos;
+    g.replayVpos = (uint16_t)g.Vpos;
+    InitSprites(0x6000, 0, 0x1C0);
+    g.brightness = 0;
+    g.fadestep = 0xA;
+    SetFrameHook(SYM_BrightnessHook);
+    ScreenOn();
+    SprSort();
+    SpriteFrameStart();
+    setvideo();
+    SpriteFrameEnd();
+    g.d7 = 1;
+    g.sflags3[0] &= (uint16_t)~2;
+    Pad pd;
+    uint16_t wait;
+    goto frame;
+view:
+    if (!(g.replaylock & 0x8000)) {
+        uint16_t x = g.replaylock;
+        g.Xpos[CAM] = (int16_t)r16(RAM_OFF_Xpos + x);
+        g.replayHpos = clamp_h(ease((uint16_t)g.Xpos[CAM], g.replayHpos, 4));
+        g.Hpos = (int16_t)g.replayHpos;
+        w16(RAM_OFF_Ypos + camobj, r16(RAM_OFF_Ypos + x));
+        g.replayVpos = clamp_v(ease(r16(RAM_OFF_Ypos + camobj), g.replayVpos, 4));
+        g.Vpos = (int16_t)g.replayVpos;
+        w16(RAM_OFF_PadControlObj + 0xC, x >> 1);
+    } else if (g.replaylock == 0xFFFF) {
+        g.replayHpos = (uint16_t)g.Hpos;
+        g.replayVpos = (uint16_t)g.Vpos;
+    } else {
+        g.replayHpos = clamp_h(ease((uint16_t)g.Xpos[CAM], g.replayHpos, 2));
+        g.Hpos = (int16_t)g.replayHpos;
+        g.replayVpos = clamp_v(ease(r16(RAM_OFF_Ypos + camobj), g.replayVpos, 2));
+        g.Vpos = (int16_t)g.replayVpos;
+    }
+    g.timestep = g.d7;
+    SprSort();
+    SpriteFrameStart();
+    setvideo();
+    SpriteFrameEnd();
+    g.replaynewframe = 0;
+frame:
+    WaitFrames_Inc(g.d7 ? g.d7 : 1, 0);
+    ReadPads();
+    pd = ReadPausePad();
+    g.d7 = 1;
+    if (!(pd.dir & 8)) {
+        uint16_t d5 = pd.dir, d4 = 0xFFFF, best = 0xFFFF;
+        g.replaylock = 0xFFFF;
+        for (uint16_t a0 = 0x16; !(a0 & 0x8000); a0 = (uint16_t)(a0 - 2)) {
+            if (r16(RAM_OFF_position + a0) & 0x8000) continue;
+            uint16_t d0 = (uint16_t)(r16(RAM_OFF_Xpos + a0) - g.Xpos[CAM]);
+            uint16_t d1 = (uint16_t)(r16(RAM_OFF_Ypos + a0) - r16(RAM_OFF_Ypos + camobj));
+            uint16_t a = vtoa(d0, d1);
+            if (a == 8) continue;
+            a = (uint16_t)(a - d5);
+            if (a && a != 1 && a != 7) continue;
+            uint16_t h = (uint16_t)(d0 >> 3 | (d0 & 0x8000 ? 0xE000 : 0));
+            uint16_t s = Mul8S(h, h);
+            h = (uint16_t)(d1 >> 3 | (d1 & 0x8000 ? 0xE000 : 0));
+            s = (uint16_t)(Mul8S(h, h) + s);
+            if (s >= best) continue;
+            best = s;
+            d4 = a0;
+        }
+        if (!(d4 & 0x8000) && best < 2) {
+            g.replaylock = d4;
+            g.d7 = 0x1E;
+            g.sflags &= (uint16_t)~0x20;
+            goto view;
+        }
+        pd = ReadPausePad();
+        g.replaylock = 0xFFFE;
+        g.sflags |= 0x20;
+        uint16_t c = pd.dir >> 14 & 1, y = (uint16_t)(pd.dir << 2);   /* (the second asl's carry, into the adc) */
+        uint16_t sx = db16(SYM_ReplayMode_14 >> 16, (uint16_t)(SYM_ReplayMode_14 + y));
+        uint16_t sy = db16(SYM_ReplayMode_14 >> 16, (uint16_t)(SYM_ReplayMode_14 + 2 + y));
+        uint16_t d2 = (uint16_t)(sx + g.Xpos[CAM] + c);
+        w16(RAM_OFF_Xvel + camobj, (uint16_t)(sx << 8));
+        uint16_t d3 = (uint16_t)(sy + r16(RAM_OFF_Ypos + camobj));
+        w16(RAM_OFF_Yvel + camobj, (uint16_t)(sy << 8));
+        w16(RAM_OFF_Wallcos + camobj, 0);
+        w16(RAM_OFF_Wallsin + camobj, 0);
+        g.wcradiusx = 1;
+        g.wcradiusy = 1;
+        checkwallcoll(CAM, d2, d3, CAM);
+        uint16_t ws = r16(RAM_OFF_Wallsin + camobj), wc = r16(RAM_OFF_Wallcos + camobj);
+        if (ws | wc) {
+            uint16_t v = (uint16_t)(ws << 1) >> 8;
+            if (v >= 0x80) v |= 0xFF00;
+            d2 = (uint16_t)(v + g.Xpos[CAM]);
+            v = (uint16_t)(wc << 1) >> 8;
+            if (v >= 0x80) v |= 0xFF00;
+            d3 = (uint16_t)(-v + r16(RAM_OFF_Ypos + camobj));
+        }
+        g.Xpos[CAM] = (int16_t)d2;
+        g.Hpos = (int16_t)d2;
+        w16(RAM_OFF_Ypos + camobj, d3);
+        g.Vpos = (int16_t)d3;
+        w16(RAM_OFF_PadControlObj + 0xC, 0x10);
+        goto view;
+    }
+    if (g.replaylock == 0xFFFF) {
+        uint16_t pc = r16(RAM_OFF_PadControlObj);
+        w16(RAM_OFF_PadControlObj + 0xC, 0xF);
+        if (pc != 0xF) {
+            g.Xpos[CAM] = (int16_t)r16(RAM_OFF_Xpos + (uint16_t)(pc << 1));
+            w16(RAM_OFF_Ypos + camobj, r16(RAM_OFF_Ypos + (uint16_t)(pc << 1)));
+        } else {
+            uint16_t a = (uint16_t)g.Xpos[14];
+            if ((uint16_t)(a - 0xFF78) & 0x8000) a = 0xFF78;
+            if (!((uint16_t)(a - sideline) & 0x8000)) a = sideline;
+            g.Xpos[CAM] = (int16_t)a;
+            a = (uint16_t)g.pucky[0];
+            if ((uint16_t)(a - 0xFED4) & 0x8000) a = 0xFED4;
+            if (!((uint16_t)(a - 0x12C) & 0x8000)) a = 0x12C;
+            w16(RAM_OFF_Ypos + camobj, a);
+        }
+    }
+    if (pd.press & 0x8000) {
+        if (g.replaypanel) {
+            FillVRAMSplit((uint16_t)(g.blankchar + g.charofs), 0x180, 0);
+            WaitFrame();
+            g.replaypanel = 0;
+        }
+        g.sflags3[0] ^= 2;
+    }
+    if (pd.held & 0x20) {
+        a4 = suba4(a4);
+        wait = 6;
+        goto waits;
+    }
+    if (pd.held & 0x50) {
+        a4 = adda4(a4);
+        wait = pd.held & 0x10 ? 6 : 0xC;
+        goto waits;
+    }
+    if (pd.press & 0x2000) {
+        g.replaylock = 0xFFFF;
+        g.sflags &= (uint16_t)~0x20;
+        goto frame;
+    }
+    if (pd.press & 0x1000) goto out;
+    if (pd.held & 0x80) {
+        a4 = adda4(a4);
+        a4 = adda4(a4);
+        goto still;
+    }
+    if (pd.held & 0x4000) {
+        a4 = suba4(a4);
+        a4 = suba4(a4);
+        goto still;
+    }
+    if (!(g.sflags3[0] & 2)) goto frame;
+    a4 = adda4(a4);
+    if (!g.d7) goto still;
+    replay_sound(g.recsfx2, r16(RAM_OFF_recsfxvol2), r16(RAM_OFF_recsfxpitch2));
+    replay_sound(g.recsfx, r16(RAM_OFF_recsfxvol), r16(RAM_OFF_recsfxpitch));
+    goto view;
+waits:
+    WaitFrames_Inc(wait, 0);
+still:
+    SoundVoicesOff();
+    g.d7 = 1;
+    g.sflags3[0] &= (uint16_t)~2;
+    goto view;
+out:
+    w16(RAM_OFF_PadControlObj + 0xC, 0xF);
+    SoundVoicesOff();
+    g.Hpos = saved_h;
+    g.Vpos = saved_v;
+    g.ReplayBufferPtr = saved_ptr;
+    g.sflags &= (uint16_t)~0x20;
+    RestoreReplayFrame(g.ReplayBufferPtr);
+    g.sflags &= (uint16_t)~0x0800;
+    SetHor();
+    SpriteFrameStart();
+    setvideo();
+    SpriteFrameEnd();
+    g.textdirtylo = 0;
+    g.textdirtyhi = 0x3FF;
+    FadeOut();
+    FadeOutSound();
+    while (g.brightness || g.SoundFadeSpeed) hal_wait_interrupt();
+    forceblack();
+    if (g.shootoutmode || !g.replaymusic) return;
+    SPCMenuUpload();
+    if (g.OptPlayMode && g.OptPlayMode != 4 && g.playoffRoundIdx >= 2) MusicStart(SYM_PlayoffSong);
+    else MusicStart(SYM_MenuSong);
+}

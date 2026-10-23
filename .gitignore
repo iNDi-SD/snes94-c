@@ -1,0 +1,8 @@
+# ROMs are never committed: the game reads the player's own cartridge
+*.smc
+*.sfc
+/build/
+/out/
+# what the program writes beside itself: the settings
+*.srm
+settings.ini

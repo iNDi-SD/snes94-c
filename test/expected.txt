@@ -1,0 +1,12 @@
+# sha256 of each script's golden file (frames, then name) as ninety-four-snes (edbaba9, at the cartridge's speed) wrote it, 2026-10-22
+# (a copy of it built with hash_frame writing golden's line). Lines with a script and options after
+# the name (2026-10-22): the same copy run on the ROM with GetPeriodTime_timetab's 300 set to 30
+# (golden's --period30), at the cartridge's speed for full_game_30s and with its fast
+# setting for full_game_30s_smooth (golden's --smooth, Game Speed Smooth); that copy also reproduced full_game's hash above.
+a845d3fe950a2d7828580ac459e26ff6bc80212bf07c588a90003094bae5f9b6 39500 full_game
+b0f3e348184989f9eeedc1965a25389f4f50eeedf7fcc428e05254cd6650b529 10500 full_game_30s full_game_30s --period30
+902b1a8faf4cb5e5a844f6a2689974c7dcda4feb1575ea76df310178c3613dc9 15500 full_game_30s_smooth full_game_30s_smooth --period30 --smooth
+ccf4e23f98f6c380c389a8884a1e1ac4dc9a36cf47781698673bdd82ff850b52 7000 mp5
+0f2556ae2fc9054f357c0dad7fd3d0371db8eb9cda1fc3f79e2e9b2d55743bcb 13000 pause_menus
+8fb8c197011a3f5ab465941e26cfedaa1e5640f80c03879b6acae31a1321d9a8 20000 random_play
+026f71d3d654105e798dcc7cd40fcb5ddedd80d1b4bc559c122f635f297e1357 10500 shootout
